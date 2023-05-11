@@ -1,0 +1,144 @@
+pipeline {
+    agent any
+
+    tools {
+        maven 'Maven-3.9.1'
+        jdk 'JDK11'
+        nodejs 'NodeJS'
+    }
+
+    environment {
+        XML_REPORT_PATH = 'target/surefire-reports/TEST-*.xml'
+        TEST_ID = '[TEST_ID_HERE]'
+        REPO_NAME = '[REPO_NAME_HERE]'
+    }
+
+    stages {
+        stage('clean staging files') {
+            steps {
+                script{
+                    sh 'git clean -f -d'
+                }
+            }
+        }
+        stage('Build') {
+            steps {
+                script{
+                    try {
+                        sh 'mvn clean install'
+                    } catch (Exception e) {
+                        echo 'Build stage failed.'
+                    }
+                }
+            }
+        }
+        stage('move tests to default directory') {
+            steps {
+                script{
+                    sh 'rm -rf src/test/java'
+                    sh 'mkdir -p src/test/java && find tests_repo -name "*.java" -exec mv {} src/test/java/ \\;'
+                }
+            }
+        }
+        stage('Test') {
+            steps {
+                script{
+                    try {
+                        sh 'mvn test -Dmaven.test.failure.ignore=true -Dsurefire.reportsDirectory=target/surefire-reports'
+                    } catch (Exception e) {
+                        echo 'Build stage failed.'
+                    }
+                }
+            }
+        }
+        stage('Convert and Send Test Results') {
+    steps {
+        withCredentials([string(credentialsId: 'be-token', variable: 'BE_TOKEN')]) {
+            sh 'npm install xml2js axios'
+            sh '''
+                node -e "
+                    (async () => {
+                    const fs = require('fs');
+                    const xml2js = require('xml2js');
+                    const axios = require('axios');
+
+                    const testResultsDir = 'target/surefire-reports';
+                    const parser = new xml2js.Parser();
+                    const allResults = [];
+
+                    await fs.readdirSync(testResultsDir).forEach(async(file) => {
+                        if (file.startsWith('TEST-') && file.endsWith('.xml')) {
+                            const xmlData = fs.readFileSync(testResultsDir + '/' + file, 'utf-8');
+                            const jsonData = await parser.parseStringPromise(xmlData);
+                            if (jsonData.testsuite.testcase) {
+                                const testCases = Array.isArray(jsonData.testsuite.testcase) ? jsonData.testsuite.testcase : [jsonData.testsuite.testcase];
+                                const optimizedData = testCases.map((testcase) => {
+                                    return {
+                                        name: testcase.$.name,
+                                        classname: testcase.$.classname,
+                                        failure: testcase.failure[0]._,
+                                        passed: testcase.failure === undefined
+                                    };
+                                });
+                                const fullData = {
+                                    file: optimizedData[0].classname,
+                                    tests: optimizedData,
+                                }
+                                allResults.push(fullData);
+                            }
+                        }
+                    });
+                    console.log('ahotottottoewod: ' + allResults);
+                    // Replace the URL below with your backend endpoint URL
+                    const backendUrl = 'http://bawix.xyz:81/server/api/v1/student/evaluation/results';
+
+                    axios
+                        .post(backendUrl, {testId: '${TEST_ID}', results: allResults}, {
+                            headers: {
+                                Authorization: 'token ${BE_TOKEN}'
+                            }
+                        })
+                        .then((response) => {
+                            console.log('Sent results: ' + response.status);
+                        })
+                        .catch((error) => {
+                            console.error('Failed to send results: ' + error.message);
+                        });
+                    })();
+                "
+            '''
+        }
+    }
+}
+
+
+        stage('Commit Test Results') {
+            steps {
+                withCredentials([string(credentialsId: 'gitea_access_token', variable: 'GITEA_ADMIN_ACCESS_TOKEN')]) {
+                    script {
+                        sh 'git checkout master'
+                        // Configure Git user name and email
+                        sh 'git config user.name "studentCODE"'
+                        sh 'git config user.email "studentcode@studentcode.com"'
+
+                        // Add the test result XML files
+                        sh 'git add -f target/surefire-reports/*.xml'
+
+                        // Check if there are any changes to commit
+                        def hasChanges = sh(returnStatus: true, script: 'git diff-index --quiet HEAD') != 0
+
+                        if (hasChanges) {
+                            // Commit the test result XML files
+                            sh 'git commit -m "Update test result XML files"'
+
+                            // Push the commit to the remote repository
+                            sh 'git push http://${GITEA_ADMIN_ACCESS_TOKEN}@bawix.xyz:81/gitea/${REPO_NAME}.git master --force'
+                        } else {
+                            echo 'No test result changes to commit'
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
